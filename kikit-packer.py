@@ -15,10 +15,10 @@ def powerset(iterable):
     return chain.from_iterable(combinations(s, r) for r in range(len(s) + 1))
 
 
-def optimal_pack(sizes, max_width=None, max_height=None):
+def optimal_pack(sizes, max_width=None, max_height=None, allow_rotate=True):
     best_rotate, best_positions, best_density = (), (), -1
     best_rotated_area = 0
-    for rotated_sizes_indices in powerset(range(len(sizes))):
+    for rotated_sizes_indices in (powerset(range(len(sizes))) if allow_rotate else [()]):
         sizes_with_rotations = [((height, width) if i in rotated_sizes_indices else (width, height))
                                 for (i, (width, height)) in enumerate(sizes)]
 
@@ -57,6 +57,7 @@ class Plugin(LayoutPlugin):
 
         max_width = yaml_data['max_width'] * mm if 'max_width' in yaml_data else None
         max_height = yaml_data['max_height'] * mm if 'max_height' in yaml_data else None
+        allow_rotate = yaml_data.get('allow_rotate', True)
         print(f"max_height: {max_height}, max_width: {max_width}")
 
         panel.sourcePaths.add(mainInputFile)
@@ -71,6 +72,7 @@ class Plugin(LayoutPlugin):
         sizes = []
         boards = []
         filenames = []
+        board_labels = []
         for d in input_boards:
             filename = d['board']
             rotate_deg = float(d.get('rotate', 0))  # pre-rotate TODO
@@ -89,6 +91,14 @@ class Plugin(LayoutPlugin):
 
             board = pcbnew.LoadBoard(filename)
 
+            tb = board.GetTitleBlock()
+            title = tb.GetTitle()
+            rev = tb.GetRevision()
+            label = f"{title}-{rev}" if title and rev else (title or rev or os.path.basename(filename))
+            qty_label = f"{count}x {label}" if count > 1 else label
+            if qty_label not in board_labels:
+                board_labels.append(qty_label)
+
             bbox = expandRect(findBoardBoundingBox(board), margin)
 
             sizes.extend([(
@@ -99,9 +109,44 @@ class Plugin(LayoutPlugin):
             boards.extend([board] * count)
             filenames.extend([filename] * count)
 
-        pack_max_w = -(-int(max_width) // S) if max_width is not None else None
-        pack_max_h = -(-int(max_height) // S) if max_height is not None else None
-        best_rotates, best_positions = optimal_pack(sizes, max_width=pack_max_w, max_height=pack_max_h)
+        fixed_layout = yaml_data.get('fixed_layout', None)
+        if fixed_layout == 'row':
+            # Place boards left-to-right in YAML order, no packing
+            best_rotates = [False] * len(boards)
+            best_positions = []
+            x = 0
+            for w, h in sizes:
+                best_positions.append((x, 0))
+                x += w
+        elif fixed_layout == 'column':
+            # Place boards top-to-bottom in YAML order, no packing
+            best_rotates = [False] * len(boards)
+            best_positions = []
+            y = 0
+            for w, h in sizes:
+                best_positions.append((0, y))
+                y += h
+        else:
+            pack_max_w = -(-int(max_width) // S) if max_width is not None else None
+            pack_max_h = -(-int(max_height) // S) if max_height is not None else None
+            best_rotates, best_positions = optimal_pack(sizes, max_width=pack_max_w, max_height=pack_max_h, allow_rotate=allow_rotate)
+
+        # Center boards relative to each other if requested
+        if yaml_data.get('center', False) and len(best_positions) > 1:
+            if fixed_layout == 'column' or (fixed_layout is None):
+                # Center horizontally: find max width, shift each board's x
+                max_w = max(sizes[i][0] for i in range(len(sizes)))
+                best_positions = [
+                    (pos[0] + (max_w - sizes[i][0]) // 2, pos[1])
+                    for i, pos in enumerate(best_positions)
+                ]
+            elif fixed_layout == 'row':
+                # Center vertically: find max height, shift each board's y
+                max_h = max(sizes[i][1] for i in range(len(sizes)))
+                best_positions = [
+                    (pos[0], pos[1] + (max_h - sizes[i][1]) // 2)
+                    for i, pos in enumerate(best_positions)
+                ]
 
         print(best_rotates, best_positions)
 
@@ -117,6 +162,13 @@ class Plugin(LayoutPlugin):
                 inheritDrc=False,
                 bakeText=True,
             )
+
+        # Set panel title block from combined board labels
+        panel_tb = panel.board.GetTitleBlock()
+        panel_tb.SetTitle(" + ".join(board_labels))
+        panel_tb.SetRevision("")
+        panel_tb.SetComment(0, f"Panelized from {len(input_boards)} board(s)")
+        panel.board.SetTitleBlock(panel_tb)
 
         print('Done.')
 
